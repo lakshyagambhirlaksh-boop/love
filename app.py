@@ -29,6 +29,17 @@ API_BASE = "https://api.india.delta.exchange"
 REFRESH_MS = 3000
 
 
+def api_credential(name: str) -> str:
+    """Read credentials from local environment variables or Streamlit secrets."""
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    try:
+        return str(st.secrets.get(name, "")).strip()
+    except Exception:
+        return ""
+
+
 class DeltaAPIError(RuntimeError):
     def __init__(self, message: str, context: dict[str, Any] | None = None):
         super().__init__(message)
@@ -39,8 +50,8 @@ class DeltaClient:
     """Small Delta REST client. API secrets are never included in messages."""
 
     def __init__(self) -> None:
-        self.api_key = os.getenv("DELTA_API_KEY", "").strip()
-        self.api_secret = os.getenv("DELTA_API_SECRET", "").strip()
+        self.api_key = api_credential("DELTA_API_KEY")
+        self.api_secret = api_credential("DELTA_API_SECRET")
 
     @property
     def configured(self) -> bool:
@@ -57,7 +68,7 @@ class DeltaClient:
             headers["Content-Type"] = "application/json"
         if signed:
             if not self.configured:
-                raise DeltaAPIError("API credentials are missing from .env")
+                raise DeltaAPIError("API credentials are missing from .env or Streamlit secrets")
             timestamp = str(int(time.time()))
             message = method.upper() + timestamp + path_query + body_text
             signature = hmac.new(self.api_secret.encode(), message.encode(), hashlib.sha256).hexdigest()
@@ -722,7 +733,7 @@ with st.sidebar:
         st.caption(connection_message)
         if "IP restriction" in connection_message:
             st.caption("If Delta currently sees an IPv6 address above, add that exact IPv6 address to the API key allowlist. You can allowlist both address families.")
-    st.caption("API credentials are loaded from the ignored local .env file.")
+    st.caption("API credentials are loaded from local .env or Streamlit secrets.")
     st.header("Background worker")
     if snapshot["state"] in {"ARMED", "RUNNING", "PAUSED", "CLOSING"}:
         st.success("Running")

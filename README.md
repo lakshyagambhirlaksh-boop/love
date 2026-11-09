@@ -13,7 +13,7 @@ python -m streamlit run app.py
 
 Open the local URL Streamlit prints, usually `http://localhost:8501`.
 
-The app reads `DELTA_API_KEY` and `DELTA_API_SECRET` from the ignored `.env` file. To set it up, copy `.env.example` to `.env` and enter your credentials there. Keep those credentials private; `.env` is excluded from Git.
+The app reads `DELTA_API_KEY` and `DELTA_API_SECRET` from environment variables, `.env`, or Streamlit secrets. Locally, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and enter your credentials there, or use `.env.example`. Keep credentials private; `.env` and `.streamlit/secrets.toml` are excluded from Git. On Streamlit Community Cloud, enter the same TOML values in the app's Secrets settings.
 
 ## Strategy behavior
 
