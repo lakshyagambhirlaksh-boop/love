@@ -1,0 +1,29 @@
+# Delta Options Live Dashboard
+
+Local Streamlit dashboard for Delta Exchange India BTC and XAUT options.
+
+## Start
+
+Run `start-dashboard.bat`, or from PowerShell:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
+```
+
+Open the local URL Streamlit prints, usually `http://localhost:8501`.
+
+The app reads `DELTA_API_KEY` and `DELTA_API_SECRET` from the ignored `.env` file. To set it up, copy `.env.example` to `.env` and enter your credentials there. Keep those credentials private; `.env` is excluded from Git.
+
+## Strategy behavior
+
+- Select BTC, XAUT and expiry, then choose the same ATM strike for call and put, or symmetric paired strikes from ±1 through ±3 around ATM.
+- Entry submits separate market sell orders for the call and put at the scheduled IST start time.
+- Entry premium is the sum of the two actual average fill prices.
+- Exit monitoring uses only the sum of the two current best asks. It closes when the ask reaches twice the entry credit (stop) or the configured fraction of entry credit (default 0.50, take profit).
+- BTC and XAUT have independent scheduled close times. An asset's close time can be changed from the dashboard while the strategy is armed, running or paused; setting a time that has already passed closes only that asset's managed positions.
+- The manual stop closes only positions tracked by this worker. The per-asset **Close now** controls close that asset while leaving the other segment active.
+- API connection checking and positions conflict checking are authenticated read operations. Orders are sent only when the user checks the live-trading acknowledgement and presses **Start live trade**.
+- The dashboard worker runs in the Streamlit server process. If that process stops, its monitoring stops too.
+
+The paired option orders are separate and can fill at different times. A call/put straddle is not a continuously delta-hedged position. The app uses a reduce-only market order to unwind filled legs if a paired entry fails, and retries managed exits when a close only partially fills.
