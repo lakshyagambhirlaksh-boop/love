@@ -31,13 +31,13 @@ REFRESH_MS = 3000
 
 def api_credential(name: str) -> str:
     """Read credentials from local environment variables or Streamlit secrets."""
-    value = os.getenv(name, "").strip()
-    if value:
-        return value
     try:
-        return str(st.secrets.get(name, "")).strip()
+        value = str(st.secrets.get(name, "")).strip()
+        if value:
+            return value
     except Exception:
-        return ""
+        pass
+    return os.getenv(name, "").strip()
 
 
 class DeltaAPIError(RuntimeError):
@@ -118,8 +118,8 @@ class DeltaClient:
         return self._request("GET", f"/v2/orders/{order_id}", signed=True).get("result", {})
 
 
-@st.cache_resource
 def get_client() -> DeltaClient:
+    # Keep credentials fresh when the local .env or Streamlit secrets change.
     return DeltaClient()
 
 
