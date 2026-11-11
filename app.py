@@ -20,7 +20,6 @@ import pandas as pd
 import requests
 import streamlit as st
 from dotenv import load_dotenv
-from streamlit_autorefresh import st_autorefresh
 
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -123,9 +122,59 @@ def get_client() -> DeltaClient:
     return DeltaClient()
 
 
-@st.cache_data(ttl=5, show_spinner=False)
+@dataclass
+class MarketDataPoller:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    chains: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    errors: dict[str, str] = field(default_factory=dict)
+    last_updated: datetime | None = None
+    worker: threading.Thread | None = None
+    client: DeltaClient = field(default_factory=get_client)
+
+    def start(self) -> None:
+        if self.worker and self.worker.is_alive():
+            return
+        self.refresh_once()
+        self.worker = threading.Thread(target=self._run, daemon=True, name="delta-market-data")
+        self.worker.start()
+
+    def refresh_once(self) -> None:
+        chains: dict[str, list[dict[str, Any]]] = {}
+        errors: dict[str, str] = {}
+        for asset in ("BTC", "XAUT"):
+            try:
+                chains[asset] = self.client.public_chain(asset)
+            except Exception as exc:
+                errors[asset] = str(exc)
+        with self.lock:
+            for asset, rows in chains.items():
+                self.chains[asset] = rows
+            self.errors = errors
+            self.last_updated = datetime.now(IST)
+
+    def _run(self) -> None:
+        while True:
+            started = time.monotonic()
+            self.refresh_once()
+            time.sleep(max(0.1, REFRESH_MS / 1000 - (time.monotonic() - started)))
+
+    def snapshot(self) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str], datetime | None]:
+        with self.lock:
+            return ({asset: list(rows) for asset, rows in self.chains.items()}, dict(self.errors), self.last_updated)
+
+
+@st.cache_resource
+def get_market_data_poller() -> MarketDataPoller:
+    poller = MarketDataPoller()
+    poller.start()
+    return poller
+
+
 def fetch_chain(asset: str) -> list[dict[str, Any]]:
-    return get_client().public_chain(asset)
+    chains, errors, _ = get_market_data_poller().snapshot()
+    if asset not in chains and asset in errors:
+        raise DeltaAPIError(errors[asset])
+    return chains.get(asset, [])
 
 
 def parse_expiry(symbol: str) -> date | None:
@@ -749,7 +798,6 @@ def quote_value(row: dict[str, Any] | None, side: str) -> float | None:
 
 
 st.set_page_config(page_title="Delta Options Live Dashboard", page_icon="Δ", layout="wide")
-st_autorefresh(interval=REFRESH_MS, key="market_refresh")
 client = get_client()
 controller = get_controller()
 if getattr(controller, "_dashboard_schema_version", 0) < 2:
@@ -783,7 +831,75 @@ strategy_active = snapshot["state"] in {"ARMED", "RUNNING", "PAUSED", "CLOSING"}
 active_setup_assets = {setup["asset"] for setup in snapshot.get("setups", [])}
 
 st.title("Delta Options Dashboard")
-st.caption("Live BTC and XAUT option data · controlled live trading · refreshes every 3 seconds")
+st.caption("Live BTC and XAUT option data · controlled live trading · quotes update in the background")
+
+
+@st.fragment(run_every="3s")
+def render_market_snapshot(assets: list[str]) -> None:
+    chains, errors, updated_at = get_market_data_poller().snapshot()
+    if updated_at:
+        st.caption(f"Latest market data: {updated_at:%H:%M:%S} IST")
+    metric_columns = st.columns(max(1, len(assets)))
+    for column, asset in zip(metric_columns, assets):
+        rows = chains.get(asset, [])
+        spot = next((as_float(row.get("spot_price")) for row in rows if as_float(row.get("spot_price")) is not None), None)
+        with column:
+            if asset in errors and not rows:
+                st.warning(f"{asset} market data unavailable")
+            else:
+                st.metric(f"{asset} index spot", f"{spot:,.4f}" if spot is not None else "—")
+
+
+@st.fragment(run_every="3s")
+def render_selected_legs(active_setups: list[dict[str, Any]], quantity: int) -> None:
+    chains, _, _ = get_market_data_poller().snapshot()
+    leg_rows: list[dict[str, Any]] = []
+    for setup in active_setups:
+        rows = chains.get(setup["asset"], [])
+        call = next((row for row in rows if row.get("symbol") == setup["call_symbol"]), None)
+        put = next((row for row in rows if row.get("symbol") == setup["put_symbol"]), None)
+        for option_type, strike_key, contract in (
+            ("CALL · SELL", "call_strike", call),
+            ("PUT · SELL", "put_strike", put),
+        ):
+            leg_rows.append({
+                "Segment": setup["asset"], "Expiry (Asia/Kolkata)": setup["expiry_label"],
+                "Strike choice": setup["strike_choice"], "Type": option_type,
+                "Strike": setup[strike_key], "Contract": setup[f"{strike_key.replace('_strike', '_symbol')}"],
+                "Bid": quote_value(contract, "bid"), "Ask": quote_value(contract, "ask"),
+                "Contracts": quantity,
+            })
+    if leg_rows:
+        st.dataframe(pd.DataFrame(leg_rows), hide_index=True, width="stretch")
+    else:
+        st.info("Choose a segment and expiry with a listed ATM call/put pair.")
+
+
+@st.fragment(run_every="3s")
+def render_running_summary(active_controller: TradeController) -> None:
+    live_snapshot = active_controller.snapshot()
+    active = live_snapshot["state"] in {"ARMED", "RUNNING", "PAUSED", "CLOSING"}
+    if active:
+        for setup in live_snapshot.get("setups", []):
+            asset = setup["asset"]
+            matching_trades = [
+                trade for trade in live_snapshot["trades"]
+                if trade.asset == asset and trade.status == "OPEN"
+            ]
+            trade = matching_trades[-1] if matching_trades else None
+            st.markdown(f"**{asset}**")
+            metric_cols = st.columns(4)
+            values = ("—", "—", "—", "—") if trade is None else (
+                f"{trade.entry_credit:,.2f}",
+                f"{trade.entry_credit * trade.take_profit_fraction:,.2f}",
+                f"{trade.entry_credit * trade.stop_multiple:,.2f}",
+                f"{trade.current_pnl:,.2f}" if trade.current_pnl is not None else "—",
+            )
+            for col, label, value in zip(metric_cols, ("Total entry price", "Target", "SL", "P & L running"), values):
+                col.metric(label, value)
+    else:
+        st.metric("Strategy status", live_snapshot["state"])
+        st.caption(live_snapshot["message"])
 
 with st.sidebar:
     st.header("Market data")
@@ -829,6 +945,8 @@ with st.sidebar:
 if not segments:
     st.info("Select BTC or XAUT in the sidebar to load options.")
     st.stop()
+
+render_market_snapshot(segments)
 
 chains: dict[str, list[dict[str, Any]]] = {}
 fetch_errors: dict[str, str] = {}
@@ -876,9 +994,6 @@ for column, asset in zip(setup_columns, segments):
             disabled=setup_locked,
         )
         call_strike, put_strike = paired_strikes(expiry_rows, atm, strike_choice)
-        spot = next((as_float(r.get("spot_price")) for r in expiry_rows if as_float(r.get("spot_price")) is not None), None)
-        if spot is not None:
-            st.metric(f"{asset} index spot (ATM selection only)", f"{spot:,.4f}")
         # The close date/time are edited only in the dedicated controls below.
         asset_close_date = st.session_state.get(f"planned_close_date_{asset}", datetime.now(IST).date())
         asset_close_time = st.session_state.get(f"planned_close_{asset}", clock_time(23, 55))
@@ -902,17 +1017,7 @@ for column, asset in zip(setup_columns, segments):
         })
 
 st.subheader("Selected short option legs")
-leg_rows: list[dict[str, Any]] = []
-for setup in setups:
-    quantity = st.session_state.get("quantity_per_leg", 1)
-    leg_rows.extend([
-        {"Segment": setup["asset"], "Expiry (Asia/Kolkata)": setup["expiry_label"], "Strike choice": setup["strike_choice"], "Type": "CALL · SELL", "Strike": setup["call_strike"], "Contract": setup["call_symbol"], "Bid": setup["call_bid"], "Ask": setup["call_ask"], "Contracts": quantity},
-        {"Segment": setup["asset"], "Expiry (Asia/Kolkata)": setup["expiry_label"], "Strike choice": setup["strike_choice"], "Type": "PUT · SELL", "Strike": setup["put_strike"], "Contract": setup["put_symbol"], "Bid": setup["put_bid"], "Ask": setup["put_ask"], "Contracts": quantity},
-    ])
-if leg_rows:
-    st.dataframe(pd.DataFrame(leg_rows), hide_index=True, width="stretch")
-else:
-    st.info("Choose a segment and expiry with a listed ATM call/put pair.")
+render_selected_legs(setups, int(st.session_state.get("quantity_per_leg", 1)))
 
 with st.expander("Schedule and strategy settings", expanded=True):
     schedule_cols = st.columns(2)
@@ -1049,35 +1154,7 @@ if setups or current_state in active_close_states:
 
 snapshot = controller.snapshot()
 strategy_is_active = snapshot["state"] in {"ARMED", "RUNNING", "PAUSED", "CLOSING"}
-if strategy_is_active:
-    # Keep the running summary limited to the four requested values per asset.
-    for setup in snapshot.get("setups", []):
-        asset = setup["asset"]
-        matching_trades = [
-            trade for trade in snapshot["trades"]
-            if trade.asset == asset and trade.status == "OPEN"
-        ]
-        trade = matching_trades[-1] if matching_trades else None
-        st.markdown(f"**{asset}**")
-        metric_cols = st.columns(4)
-        if trade is None:
-            values = ("—", "—", "—", "—")
-        else:
-            values = (
-                f"{trade.entry_credit:,.2f}",
-                f"{trade.entry_credit * trade.take_profit_fraction:,.2f}",
-                f"{trade.entry_credit * trade.stop_multiple:,.2f}",
-                f"{trade.current_pnl:,.2f}" if trade.current_pnl is not None else "—",
-            )
-        for col, label, value in zip(
-            metric_cols,
-            ("Total entry price", "Target", "SL", "P & L running"),
-            values,
-        ):
-            col.metric(label, value)
-else:
-    st.metric("Strategy status", snapshot["state"])
-    st.caption(snapshot["message"])
+render_running_summary(controller)
 if not strategy_is_active and snapshot["trades"]:
     trade_table = []
     for trade in snapshot["trades"]:
