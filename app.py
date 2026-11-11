@@ -364,7 +364,7 @@ class TradeController:
             if self.entry_started:
                 close_at = datetime.combine(now.date(), close_time, tzinfo=IST)
                 if close_at <= now:
-                    close_at = now
+                    close_at += timedelta(days=1)
             else:
                 entry_at = self.config.get("entry_at")
                 if entry_at is None:
