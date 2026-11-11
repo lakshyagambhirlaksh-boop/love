@@ -26,5 +26,6 @@ The app reads `DELTA_API_KEY` and `DELTA_API_SECRET` from environment variables,
 - The manual stop closes only positions tracked by this worker. The per-asset **Close now** controls close that asset while leaving the other segment active.
 - API connection checking and positions conflict checking are authenticated read operations. Orders are sent only when the user checks the live-trading acknowledgement and presses **Start live trade**.
 - The dashboard worker runs in the Streamlit server process. If that process stops, its monitoring stops too.
+- The sidebar's **Pause dashboard refresh** control pauses only browser updates so close schedules can be edited; it does not pause the VPS trade worker.
 
 The paired option orders are separate and can fill at different times. A call/put straddle is not a continuously delta-hedged position. The app uses a reduce-only market order to unwind filled legs if a paired entry fails, and retries managed exits when a close only partially fills.

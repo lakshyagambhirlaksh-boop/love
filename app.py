@@ -27,6 +27,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 IST = ZoneInfo("Asia/Kolkata")
 API_BASE = "https://api.india.delta.exchange"
 REFRESH_MS = 3000
+DASHBOARD_REFRESH_MS = 5000
 
 
 def api_credential(name: str) -> str:
@@ -749,7 +750,6 @@ def quote_value(row: dict[str, Any] | None, side: str) -> float | None:
 
 
 st.set_page_config(page_title="Delta Options Live Dashboard", page_icon="Δ", layout="wide")
-st_autorefresh(interval=REFRESH_MS, key="market_refresh")
 client = get_client()
 controller = get_controller()
 if getattr(controller, "_dashboard_schema_version", 0) < 2:
@@ -786,6 +786,14 @@ st.title("Delta Options Dashboard")
 st.caption("Live BTC and XAUT option data · controlled live trading · refreshes every 3 seconds")
 
 with st.sidebar:
+    pause_dashboard_refresh = st.toggle(
+        "Pause dashboard refresh", value=False, key="pause_dashboard_refresh",
+        help="Pause screen updates while editing close dates or times. The live trade worker keeps running.",
+    )
+    if pause_dashboard_refresh:
+        st.caption("Screen refresh is paused; live trade monitoring continues on the VPS.")
+    else:
+        st_autorefresh(interval=DASHBOARD_REFRESH_MS, key="market_refresh")
     st.header("Market data")
     st.markdown(f"**Delta endpoint:**  \n`{API_BASE}`")
     selected_segments = st.multiselect(
