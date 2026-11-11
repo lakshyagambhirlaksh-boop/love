@@ -284,9 +284,10 @@ class TradeController:
             config["close_at_by_asset"] = {}
             config["close_reason_by_asset"] = {}
             for setup in config["setups"]:
-                close_at = datetime.combine(entry_at.date(), setup["close_time"], tzinfo=IST)
+                close_date = setup.get("close_date", entry_at.date())
+                close_at = datetime.combine(close_date, setup["close_time"], tzinfo=IST)
                 if close_at <= entry_at:
-                    close_at += timedelta(days=1)
+                    raise ValueError(f"{setup['asset']} close date/time must be after the scheduled trade start")
                 config["close_at_by_asset"][setup["asset"]] = close_at
             self.config = config
             self._uses_legacy_close_loop = False
@@ -319,9 +320,10 @@ class TradeController:
             if any(item["asset"] == asset for item in getattr(self, "pending_entry_setups", [])):
                 raise ValueError(f"A {asset} entry is already pending")
             now = datetime.now(IST)
-            close_at = datetime.combine(now.date(), setup["close_time"], tzinfo=IST)
+            close_date = setup.get("close_date", now.date())
+            close_at = datetime.combine(close_date, setup["close_time"], tzinfo=IST)
             if close_at <= now:
-                close_at += timedelta(days=1)
+                raise ValueError(f"{asset} close date/time must be in the future")
             legacy_close = getattr(self, "_legacy_close_at", None)
             if getattr(self, "_uses_legacy_close_loop", False) and legacy_close and close_at > legacy_close:
                 raise ValueError("This older worker has an earlier global close time. It cannot safely add an asset with a later close time.")
@@ -354,26 +356,29 @@ class TradeController:
             self.state = "CLOSING"
         self.log("Stop requested; closing strategy-managed positions")
 
-    def update_close_time(self, asset: str, close_time: clock_time) -> datetime:
+    def update_close_time(self, asset: str, close_date: date, close_time: clock_time) -> datetime:
         with self.lock:
             if not self.worker or not self.worker.is_alive() or not self.config:
                 raise ValueError("No active strategy to update")
             if asset not in self.config.get("close_at_by_asset", {}):
                 raise ValueError(f"{asset} is not part of the active strategy")
             now = datetime.now(IST)
-            if self.entry_started:
-                close_at = datetime.combine(now.date(), close_time, tzinfo=IST)
-                if close_at <= now:
-                    close_at += timedelta(days=1)
-            else:
+            close_at = datetime.combine(close_date, close_time, tzinfo=IST)
+            if close_at <= now:
+                raise ValueError("Choose a future close date and time. Use Stop & close to exit immediately.")
+            if any(
+                trade.asset == asset and trade.status in {"OPEN", "CLOSING"} and trade.exit_reason
+                for trade in self.trades
+            ):
+                raise ValueError("An exit is already in progress for this asset; its close order cannot be cancelled by changing the schedule.")
+            if not self.entry_started:
                 entry_at = self.config.get("entry_at")
                 if entry_at is None:
                     requested_start = datetime.combine(now.date(), self.config["start_time"], tzinfo=IST)
                     entry_at = now if requested_start <= now else requested_start
                     self.config["entry_at"] = entry_at
-                close_at = datetime.combine(entry_at.date(), close_time, tzinfo=IST)
                 if close_at <= entry_at:
-                    close_at += timedelta(days=1)
+                    raise ValueError("Close date/time must be after the scheduled trade start")
             legacy_loop = getattr(self, "_uses_legacy_close_loop", False)
             if legacy_loop and self._legacy_close_at and close_at > self._legacy_close_at:
                 raise ValueError("This already-running worker has an earlier global close time. You can move this asset's close earlier, but cannot extend it past the existing global close without restarting the strategy.")
@@ -381,15 +386,9 @@ class TradeController:
             self.config["close_reason_by_asset"][asset] = "Scheduled close"
             for setup in self.config["setups"]:
                 if setup["asset"] == asset:
+                    setup["close_date"] = close_date
                     setup["close_time"] = close_time
                     break
-            for trade in self.trades:
-                if trade.asset == asset and trade.status == "OPEN":
-                    # A time edit changes the deadline; it is not itself a close
-                    # signal. Clear any stale scheduled-close marker so the worker
-                    # follows the newly selected deadline below.
-                    if trade.exit_reason == "Scheduled close":
-                        trade.exit_reason = None
             if legacy_loop:
                 self._legacy_close_at = (
                     close_at if self._legacy_close_at is None
@@ -431,6 +430,8 @@ class TradeController:
                 break
             time.sleep(min(remaining, 1.0))
         with self.lock:
+            if not self.config or self.config.get("close_at_by_asset", {}).get(asset) != close_at:
+                return
             trades = [t for t in self.trades if t.asset == asset and t.status in {"OPEN", "CLOSING"}]
             for trade in trades:
                 trade.status = "CLOSING"
@@ -548,7 +549,16 @@ class TradeController:
                             close_at = self.config["close_at_by_asset"].get(trade.asset)
                             close_reason = self.config["close_reason_by_asset"].get(trade.asset, "Scheduled close")
                         if close_at and now >= close_at:
-                            self._close_trade(client, trade, close_reason)
+                            with self.lock:
+                                latest_close_at = self.config["close_at_by_asset"].get(trade.asset)
+                                close_due = latest_close_at is not None and datetime.now(IST) >= latest_close_at
+                                if close_due:
+                                    close_reason = self.config["close_reason_by_asset"].get(trade.asset, "Scheduled close")
+                                    trade.exit_reason = close_reason
+                            if close_due:
+                                self._close_trade(client, trade, close_reason)
+                            else:
+                                self._monitor_trade(client, trade)
                         else:
                             self._monitor_trade(client, trade)
                 except Exception as exc:
@@ -665,10 +675,11 @@ class TradeController:
                 locks = {}
                 self.close_locks = locks
             trade_lock = locks.setdefault(id(trade), threading.Lock())
+            if trade.status != "CLOSED":
+                trade.exit_reason = reason
         with trade_lock:
             if trade.status == "CLOSED":
                 return
-            trade.exit_reason = reason
             for leg in trade.legs:
                 self._close_leg(client, leg)
             if all(leg.closed_size >= leg.size for leg in trade.legs):
@@ -868,7 +879,8 @@ for column, asset in zip(setup_columns, segments):
         spot = next((as_float(r.get("spot_price")) for r in expiry_rows if as_float(r.get("spot_price")) is not None), None)
         if spot is not None:
             st.metric(f"{asset} index spot (ATM selection only)", f"{spot:,.4f}")
-        # The close time is edited only in the dedicated controls below.
+        # The close date/time are edited only in the dedicated controls below.
+        asset_close_date = st.session_state.get(f"planned_close_date_{asset}", datetime.now(IST).date())
         asset_close_time = st.session_state.get(f"planned_close_{asset}", clock_time(23, 55))
         if call_strike is None or put_strike is None:
             st.warning("Could not determine the selected strike")
@@ -880,7 +892,7 @@ for column, asset in zip(setup_columns, segments):
             continue
         setups.append({
             "asset": asset, "expiry": expiry_text, "expiry_label": expiry_label,
-            "close_time": asset_close_time,
+            "close_date": asset_close_date, "close_time": asset_close_time,
             "strike": atm, "call_strike": call_strike, "put_strike": put_strike,
             "strike_choice": strike_choice,
             "call_symbol": call["symbol"], "put_symbol": put["symbol"],
@@ -956,8 +968,8 @@ if control_cols[3].button("Stop / close strategy trades", disabled=current_state
 active_snapshot = controller.snapshot()
 active_close_states = {"ARMED", "RUNNING", "PAUSED", "CLOSING"}
 if setups or current_state in active_close_states:
-    st.subheader("BTC and XAUT close time controls")
-    st.caption("Set each close time here. While one asset is running, you can configure and separately start the other asset.")
+    st.subheader("BTC and XAUT close schedule controls")
+    st.caption("Set a separate close date and time for each asset. Updating the schedule does not close the position; use Stop & close to exit immediately.")
     if current_state in active_close_states:
         active_setups_now = active_snapshot.get("setups", [])
         active_names_now = {setup["asset"] for setup in active_setups_now}
@@ -973,11 +985,16 @@ if setups or current_state in active_close_states:
     for close_col, active_setup in zip(close_control_columns, close_setups):
         asset = active_setup["asset"]
         scheduled_close = active_snapshot.get("close_at_by_asset", {}).get(asset)
+        default_close_date = scheduled_close.date() if scheduled_close else active_setup.get("close_date", datetime.now(IST).date())
         default_close_time = scheduled_close.time().replace(tzinfo=None) if scheduled_close else active_setup.get("close_time", clock_time(23, 55))
         with close_col.container(border=True):
             st.markdown(f"**{asset}** · scheduled close: {scheduled_close:%d %b %Y, %H:%M} IST" if scheduled_close else f"**{asset}**")
             if asset in pending_names:
                 st.caption(f"{asset} entry is queued; the worker will send its call and put orders.")
+            new_close_date = st.date_input(
+                f"{asset} close date (Asia/Kolkata)", value=default_close_date,
+                key=f"planned_close_date_{asset}", disabled=current_state == "CLOSING" or asset in pending_names,
+            )
             new_close_time = st.time_input(
                 f"{asset} close time (Asia/Kolkata)", value=default_close_time,
                 key=f"planned_close_{asset}", disabled=current_state == "CLOSING" or asset in pending_names,
@@ -989,7 +1006,7 @@ if setups or current_state in active_close_states:
                     disabled=asset in pending_names, use_container_width=True,
                 ):
                     try:
-                        updated_close_at = controller.update_close_time(asset, new_close_time)
+                        updated_close_at = controller.update_close_time(asset, new_close_date, new_close_time)
                         st.success(f"{asset} scheduled close updated to {updated_close_at:%d %b %Y, %H:%M} IST")
                         st.rerun()
                     except Exception as exc:
