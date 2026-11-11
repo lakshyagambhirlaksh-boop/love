@@ -22,6 +22,7 @@ The app reads `DELTA_API_KEY` and `DELTA_API_SECRET` from environment variables,
 - Entry premium is the sum of the two actual average fill prices.
 - Exit monitoring uses only the sum of the two current best asks. It closes when the ask reaches twice the entry credit (stop) or the configured fraction of entry credit (default 0.50, take profit).
 - BTC and XAUT have independent scheduled close times. An asset's close time can be changed from the dashboard while the strategy is armed, running or paused; setting a time that has already passed closes only that asset's managed positions.
+- While one asset is running, the other can be configured and started as a separate live trade with its own close time. An explicit per-asset confirmation is required; the additional entry uses the active strategy's quantity, take-profit and stop-loss settings.
 - The manual stop closes only positions tracked by this worker. The per-asset **Close now** controls close that asset while leaving the other segment active.
 - API connection checking and positions conflict checking are authenticated read operations. Orders are sent only when the user checks the live-trading acknowledgement and presses **Start live trade**.
 - The dashboard worker runs in the Streamlit server process. If that process stops, its monitoring stops too.

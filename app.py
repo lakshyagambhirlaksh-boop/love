@@ -250,6 +250,7 @@ class TradeController:
     paused: bool = False
     entry_started: bool = False
     close_locks: dict[int, threading.Lock] = field(default_factory=dict)
+    pending_entry_setups: list[dict[str, Any]] = field(default_factory=list)
 
     def log(self, message: str) -> None:
         with self.lock:
@@ -265,6 +266,8 @@ class TradeController:
                 "paused": self.paused,
                 "close_at_by_asset": dict(self.config.get("close_at_by_asset", {})) if self.config else {},
                 "setups": list(self.config.get("setups", [])) if self.config else [],
+                "pending_assets": [s["asset"] for s in getattr(self, "pending_entry_setups", [])],
+                "supports_separate_asset_start": bool(getattr(self, "_supports_separate_asset_start", False)),
                 "legacy_global_close": bool(getattr(self, "_uses_legacy_close_loop", False)),
                 "trades": list(self.trades),
                 "events": list(self.events),
@@ -298,9 +301,38 @@ class TradeController:
             self.stop_requested = False
             self.paused = False
             self.entry_started = False
+            self.pending_entry_setups = []
+            self._supports_separate_asset_start = True
             self.worker = threading.Thread(target=self._run, daemon=True, name="delta-live-strategy")
             self.worker.start()
         self.log("Live strategy armed; entries begin at the configured start time")
+
+    def add_asset_setup(self, setup: dict[str, Any]) -> None:
+        asset = setup["asset"]
+        with self.lock:
+            if not self.worker or not self.worker.is_alive() or not self.config or self.state != "RUNNING" or not self.entry_started:
+                raise ValueError("A separate asset can be started only while the current strategy is running")
+            if not getattr(self, "_supports_separate_asset_start", False):
+                raise ValueError("This strategy was started before separate asset starts were enabled. Start a new strategy run after this one is closed.")
+            if any(existing["asset"] == asset for existing in self.config["setups"]):
+                raise ValueError(f"{asset} is already part of this strategy")
+            if any(item["asset"] == asset for item in getattr(self, "pending_entry_setups", [])):
+                raise ValueError(f"A {asset} entry is already pending")
+            now = datetime.now(IST)
+            close_at = datetime.combine(now.date(), setup["close_time"], tzinfo=IST)
+            if close_at <= now:
+                close_at += timedelta(days=1)
+            legacy_close = getattr(self, "_legacy_close_at", None)
+            if getattr(self, "_uses_legacy_close_loop", False) and legacy_close and close_at > legacy_close:
+                raise ValueError("This older worker has an earlier global close time. It cannot safely add an asset with a later close time.")
+            setup_copy = dict(setup)
+            self.config["setups"].append(setup_copy)
+            self.config["close_at_by_asset"][asset] = close_at
+            self.config["close_reason_by_asset"][asset] = "Scheduled close"
+            if not hasattr(self, "pending_entry_setups"):
+                self.pending_entry_setups = []
+            self.pending_entry_setups.append(setup_copy)
+        self.log(f"{asset} live entry queued; worker will submit its call and put orders")
 
     def pause(self) -> None:
         with self.lock:
@@ -317,6 +349,8 @@ class TradeController:
     def stop(self) -> None:
         with self.lock:
             self.stop_requested = True
+            if hasattr(self, "pending_entry_setups"):
+                self.pending_entry_setups.clear()
             self.state = "CLOSING"
         self.log("Stop requested; closing strategy-managed positions")
 
@@ -468,6 +502,40 @@ class TradeController:
                     if not still_open:
                         return
             with self.lock:
+                pending_setups = []
+                if not self.paused and not self.stop_requested:
+                    pending_setups = list(getattr(self, "pending_entry_setups", []))
+                if pending_setups and hasattr(self, "pending_entry_setups"):
+                    self.pending_entry_setups.clear()
+            for pending_setup in pending_setups:
+                asset = pending_setup["asset"]
+                try:
+                    self._open_entries(client, {**config, "setups": [pending_setup]})
+                    with self.lock:
+                        pending_close_at = self.config["close_at_by_asset"][asset]
+                    threading.Thread(
+                        target=self._close_asset_at,
+                        args=(asset, pending_close_at, "Scheduled close"),
+                        daemon=True,
+                        name=f"delta-close-{asset}",
+                    ).start()
+                except Exception as exc:
+                    with self.lock:
+                        emergency_open = any(t.asset == asset and t.status in {"OPEN", "CLOSING"} for t in self.trades)
+                        emergency_close_at = self.config.get("close_at_by_asset", {}).get(asset) if self.config else None
+                        if self.config and not emergency_open:
+                            self.config["setups"] = [s for s in self.config["setups"] if s["asset"] != asset]
+                            self.config.get("close_at_by_asset", {}).pop(asset, None)
+                            self.config.get("close_reason_by_asset", {}).pop(asset, None)
+                    if emergency_open and emergency_close_at:
+                        threading.Thread(
+                            target=self._close_asset_at,
+                            args=(asset, emergency_close_at, "Scheduled close"),
+                            daemon=True,
+                            name=f"delta-close-{asset}",
+                        ).start()
+                    self.log(f"{asset} additional live entry failed: {exc}")
+            with self.lock:
                 current_trades = [t for t in self.trades if t.status == "OPEN"]
             for trade in current_trades:
                 if self.stop_requested:
@@ -486,10 +554,11 @@ class TradeController:
                 except Exception as exc:
                     self.log(f"Monitoring error for {trade.asset}: {exc}; will retry")
             with self.lock:
-                all_done = self.entry_started and all(t.status == "CLOSED" for t in self.trades)
-            if all_done:
-                with self.lock:
+                pending = bool(getattr(self, "pending_entry_setups", []))
+                all_done = self.entry_started and not pending and all(t.status == "CLOSED" for t in self.trades)
+                if all_done:
                     self.state = "CLOSED"
+            if all_done:
                 self.log("All strategy trades are closed")
                 return
             time.sleep(REFRESH_MS / 1000)
@@ -700,6 +769,7 @@ if getattr(controller, "_dashboard_schema_version", 0) < 2:
     controller._dashboard_schema_version = 2
 snapshot = controller.snapshot()
 strategy_active = snapshot["state"] in {"ARMED", "RUNNING", "PAUSED", "CLOSING"}
+active_setup_assets = {setup["asset"] for setup in snapshot.get("setups", [])}
 
 st.title("Delta Options Dashboard")
 st.caption("Live BTC and XAUT option data · controlled live trading · refreshes every 3 seconds")
@@ -707,7 +777,11 @@ st.caption("Live BTC and XAUT option data · controlled live trading · refreshe
 with st.sidebar:
     st.header("Market data")
     st.markdown(f"**Delta endpoint:**  \n`{API_BASE}`")
-    segments = st.multiselect("Segments to display / trade", ["BTC", "XAUT"], default=["BTC", "XAUT"], disabled=strategy_active)
+    selected_segments = st.multiselect(
+        "Segments to display / trade", ["BTC", "XAUT"], default=["BTC", "XAUT"],
+        key="segments_to_display_trade",
+    )
+    segments = list(dict.fromkeys([*selected_segments, *active_setup_assets]))
     st.header("API connection")
     st.caption("IP ADDRESSES FOR DELTA API ALLOWLIST")
     outbound_ips = get_public_outbound_ips()
@@ -772,7 +846,9 @@ for column, asset in zip(setup_columns, segments):
             continue
         expiry_labels = [d.strftime("%d %b %Y") for d in expiries]
         default_ix = next((i for i, d in enumerate(expiries) if d >= datetime.now(IST).date()), 0)
-        expiry_label = st.selectbox(f"{asset} expiry", expiry_labels, index=default_ix, key=f"expiry_{asset}", disabled=strategy_active)
+        asset_in_run = asset in active_setup_assets
+        setup_locked = strategy_active and asset_in_run
+        expiry_label = st.selectbox(f"{asset} expiry", expiry_labels, index=default_ix, key=f"expiry_{asset}", disabled=setup_locked)
         expiry_date = datetime.strptime(expiry_label, "%d %b %Y").date()
         expiry_text = expiry_date.strftime("%d-%m-%Y")
         expiry_rows = [r for r in rows if parse_expiry(r.get("symbol", "")) == expiry_date]
@@ -786,7 +862,7 @@ for column, asset in zip(setup_columns, segments):
                 "Put ATM-3 + Call ATM+3",
             ],
             key=f"strike_choice_{asset}",
-            disabled=strategy_active,
+            disabled=setup_locked,
         )
         call_strike, put_strike = paired_strikes(expiry_rows, atm, strike_choice)
         spot = next((as_float(r.get("spot_price")) for r in expiry_rows if as_float(r.get("spot_price")) is not None), None)
@@ -881,11 +957,16 @@ active_snapshot = controller.snapshot()
 active_close_states = {"ARMED", "RUNNING", "PAUSED", "CLOSING"}
 if setups or current_state in active_close_states:
     st.subheader("BTC and XAUT close time controls")
-    st.caption("Set the close time for the next run, or update the scheduled close for each active asset here.")
+    st.caption("Set each close time here. While one asset is running, you can configure and separately start the other asset.")
     if current_state in active_close_states:
-        close_setups = active_snapshot.get("setups", [])
+        active_setups_now = active_snapshot.get("setups", [])
+        active_names_now = {setup["asset"] for setup in active_setups_now}
+        candidate_setups = [setup for setup in setups if setup["asset"] not in active_names_now]
+        close_setups = [*active_setups_now, *candidate_setups]
     else:
+        active_names_now = set()
         close_setups = setups
+    pending_names = set(active_snapshot.get("pending_assets", []))
     if active_snapshot.get("legacy_global_close"):
         st.info("This run uses the previous global schedule. It supports moving an asset's close earlier; extending beyond its original global close requires a new run.")
     close_control_columns = st.columns(max(1, len(close_setups)))
@@ -895,25 +976,55 @@ if setups or current_state in active_close_states:
         default_close_time = scheduled_close.time().replace(tzinfo=None) if scheduled_close else active_setup.get("close_time", clock_time(23, 55))
         with close_col.container(border=True):
             st.markdown(f"**{asset}** · scheduled close: {scheduled_close:%d %b %Y, %H:%M} IST" if scheduled_close else f"**{asset}**")
+            if asset in pending_names:
+                st.caption(f"{asset} entry is queued; the worker will send its call and put orders.")
             new_close_time = st.time_input(
                 f"{asset} close time (Asia/Kolkata)", value=default_close_time,
-                key=f"planned_close_{asset}", disabled=current_state == "CLOSING",
+                key=f"planned_close_{asset}", disabled=current_state == "CLOSING" or asset in pending_names,
             )
-            if current_state in {"ARMED", "RUNNING", "PAUSED"}:
+            if asset in active_names_now and current_state in {"ARMED", "RUNNING", "PAUSED"}:
                 close_update_cols = st.columns([1, 1])
-                if close_update_cols[0].button(f"Update {asset} close time", key=f"update_close_{asset}", use_container_width=True):
+                if close_update_cols[0].button(
+                    f"Update {asset} close time", key=f"update_close_{asset}",
+                    disabled=asset in pending_names, use_container_width=True,
+                ):
                     try:
                         updated_close_at = controller.update_close_time(asset, new_close_time)
                         st.success(f"{asset} scheduled close updated to {updated_close_at:%d %b %Y, %H:%M} IST")
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
-                if close_update_cols[1].button(f"Stop & close {asset} now", key=f"close_now_{asset}", use_container_width=True):
+                if close_update_cols[1].button(
+                    f"Stop & close {asset} now", key=f"close_now_{asset}",
+                    disabled=asset in pending_names, use_container_width=True,
+                ):
                     try:
                         controller.close_asset_now(asset)
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
+            elif (
+                strategy_active and asset not in active_names_now and current_state == "RUNNING"
+                and active_snapshot.get("supports_separate_asset_start", False)
+            ):
+                add_confirm = st.checkbox(
+                    f"Confirm new {asset} live orders", value=False, key=f"confirm_add_{asset}"
+                )
+                if st.button(
+                    f"Start {asset} live trade now", key=f"start_asset_{asset}",
+                    disabled=not connected or not add_confirm, use_container_width=True,
+                ):
+                    try:
+                        controller.add_asset_setup(active_setup)
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+                st.caption("This uses the running strategy's quantity, take-profit and stop-loss settings.")
+            elif strategy_active and asset not in active_names_now:
+                if current_state == "RUNNING":
+                    st.caption("This strategy run predates separate live starts. Finish it before starting a new run with this asset.")
+                else:
+                    st.caption("Start the other asset after the strategy enters RUNNING.")
             elif current_state == "CLOSING":
                 st.caption("Strategy close is in progress")
             elif st.button(f"Save {asset} close time", key=f"save_close_{asset}", use_container_width=True):
