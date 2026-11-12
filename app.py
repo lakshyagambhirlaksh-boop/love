@@ -250,6 +250,22 @@ def fetch_chain(asset: str) -> list[dict[str, Any]]:
     return chains.get(asset, [])
 
 
+def cached_ask_pnl(trade: ManagedStraddle) -> float | None:
+    chains, _, updated_at = get_market_data_poller().snapshot()
+    if not updated_at or (datetime.now(IST) - updated_at).total_seconds() > 15:
+        return None
+    rows = chains.get(trade.asset, [])
+    call = next((row for row in rows if row.get("symbol") == trade.call_symbol), None)
+    put = next((row for row in rows if row.get("symbol") == trade.put_symbol), None)
+    if not call or not put:
+        return None
+    call_ask = as_float((call.get("quotes") or {}).get("best_ask"))
+    put_ask = as_float((put.get("quotes") or {}).get("best_ask"))
+    if call_ask is None or put_ask is None:
+        return None
+    return trade.entry_credit - call_ask - put_ask
+
+
 def parse_expiry(symbol: str) -> date | None:
     try:
         suffix = symbol.rsplit("-", 1)[-1]
@@ -992,17 +1008,20 @@ def render_running_summary(active_controller: TradeController) -> None:
             asset = setup["asset"]
             matching_trades = [
                 trade for trade in live_snapshot["trades"]
-                if trade.asset == asset and trade.status == "OPEN"
+                if trade.asset == asset and trade.status in {"OPEN", "CLOSING"}
             ]
             trade = matching_trades[-1] if matching_trades else None
             st.markdown(f"**{asset}**")
             metric_cols = st.columns(4)
             expired = bool(trade and contract_has_expired(trade))
+            live_pnl = trade.current_pnl if trade is not None else None
+            if trade is not None and live_pnl is None and not expired:
+                live_pnl = cached_ask_pnl(trade)
             values = ("—", "—", "—", "—") if trade is None else (
                 f"{trade.entry_credit:,.2f}",
                 f"{trade.entry_credit * trade.take_profit_fraction:,.2f}",
                 f"{trade.entry_credit * trade.stop_multiple:,.2f}",
-                f"{trade.current_pnl:,.2f}" if not expired and trade.current_pnl is not None else "—",
+                f"{live_pnl:,.2f}" if not expired and live_pnl is not None else "—",
             )
             for col, label, value in zip(metric_cols, ("Total entry price", "Target", "SL", "P & L running"), values):
                 col.metric(label, value)
