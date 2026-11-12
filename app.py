@@ -901,16 +901,9 @@ def render_running_summary(active_controller: TradeController) -> None:
         st.metric("Strategy status", live_snapshot["state"])
         st.caption(live_snapshot["message"])
 
-with st.sidebar:
-    st.header("Market data")
-    st.markdown(f"**Delta endpoint:**  \n`{API_BASE}`")
-    selected_segments = st.multiselect(
-        "Segments to display / trade", ["BTC", "XAUT"], default=["BTC", "XAUT"],
-        key="segments_to_display_trade",
-    )
-    segments = list(dict.fromkeys([*selected_segments, *active_setup_assets]))
-    st.header("API connection")
-    st.caption("IP ADDRESSES FOR DELTA API ALLOWLIST")
+
+@st.fragment(run_every="15s")
+def render_api_connection_status(status_slot: Any) -> None:
     outbound_ips = get_public_outbound_ips()
     try:
         connected, connection_message, delta_seen_ip = check_api_connection()
@@ -922,25 +915,43 @@ with st.sidebar:
             connection_message = "API key IP restriction: allowlist this computer/server's public outbound IP in Delta Exchange API-key settings."
         else:
             connection_message = "Delta API connection failed; check API credentials, key permissions, and network access."
-    if delta_seen_ip:
-        st.code(f"Delta currently sees: {delta_seen_ip}\nIPv4 candidate: {outbound_ips['IPv4']}\nIPv6 candidate: {outbound_ips['IPv6']}", language=None)
-    else:
-        st.code(f"IPv4: {outbound_ips['IPv4']}\nIPv6: {outbound_ips['IPv6']}", language=None)
-    if connected:
-        st.success("CONNECTED")
-        st.caption("Private Delta API check passed")
-    else:
-        st.error("NOT CONNECTED")
-        st.caption(connection_message)
-        if "IP restriction" in connection_message:
-            st.caption("If Delta currently sees an IPv6 address above, add that exact IPv6 address to the API key allowlist. You can allowlist both address families.")
-    st.caption("API credentials are loaded from local .env or Streamlit secrets.")
+    st.session_state["delta_api_connected"] = connected
+    with status_slot:
+        st.caption("IP ADDRESSES FOR DELTA API ALLOWLIST")
+        if delta_seen_ip:
+            st.code(f"Delta currently sees: {delta_seen_ip}\nIPv4 candidate: {outbound_ips['IPv4']}\nIPv6 candidate: {outbound_ips['IPv6']}", language=None)
+        else:
+            st.code(f"IPv4: {outbound_ips['IPv4']}\nIPv6: {outbound_ips['IPv6']}", language=None)
+        if connected:
+            st.success("CONNECTED")
+            st.caption("Private Delta API check passed")
+        else:
+            st.error("NOT CONNECTED")
+            st.caption(connection_message)
+            if "IP restriction" in connection_message:
+                st.caption("If Delta currently sees an IPv6 address above, add that exact IPv6 address to the API key allowlist. You can allowlist both address families.")
+        st.caption("API credentials are loaded from local .env or Streamlit secrets.")
+
+
+with st.sidebar:
+    st.header("Market data")
+    st.markdown(f"**Delta endpoint:**  \n`{API_BASE}`")
+    selected_segments = st.multiselect(
+        "Segments to display / trade", ["BTC", "XAUT"], default=["BTC", "XAUT"],
+        key="segments_to_display_trade",
+    )
+    segments = list(dict.fromkeys([*selected_segments, *active_setup_assets]))
+    st.header("API connection")
+    connection_status_slot = st.container()
     st.header("Background worker")
     if snapshot["state"] in {"ARMED", "RUNNING", "PAUSED", "CLOSING"}:
         st.success("Running")
     else:
         st.info(snapshot["state"])
     st.caption("Worker runs while this Streamlit server process stays running.")
+
+render_api_connection_status(connection_status_slot)
+connected = bool(st.session_state.get("delta_api_connected", False))
 
 if not segments:
     st.info("Select BTC or XAUT in the sidebar to load options.")
