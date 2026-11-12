@@ -62,6 +62,13 @@ class DeltaClient:
             self._thread_sessions.session = session
         return session
 
+    def _reset_session(self) -> None:
+        """Drop a stale keep-alive connection before a safe read retry."""
+        session = getattr(self._thread_sessions, "session", None)
+        if session is not None:
+            session.close()
+            del self._thread_sessions.session
+
     @property
     def configured(self) -> bool:
         return bool(self.api_key and self.api_secret and "put_your_" not in self.api_key and "put_your_" not in self.api_secret)
@@ -74,7 +81,11 @@ class DeltaClient:
         body_text = json.dumps(body, separators=(",", ":")) if body is not None else ""
         if signed and not self.configured:
             raise DeltaAPIError("API credentials are missing from .env or Streamlit secrets")
-        attempts = 2 if signed else 1
+        # GET requests are safe to retry after a broken keep-alive/TLS connection.
+        # Never blindly retry order POSTs: a timeout can happen after Delta accepted
+        # the order, and a second POST could create a duplicate position.
+        safe_read = method.upper() == "GET"
+        attempts = 3 if safe_read else (2 if signed else 1)
         for attempt in range(attempts):
             headers = {"Accept": "application/json"}
             if body is not None:
@@ -88,9 +99,13 @@ class DeltaClient:
                 response = self._session().request(
                     method.upper(), API_BASE + path_query,
                     data=body_text if body is not None else None,
-                    headers=headers, timeout=12,
+                    headers=headers, timeout=(5, 10),
                 )
             except requests.RequestException as exc:
+                if safe_read and attempt + 1 < attempts:
+                    self._reset_session()
+                    time.sleep(0.25 * (attempt + 1))
+                    continue
                 raise DeltaAPIError("Could not reach Delta Exchange") from exc
             try:
                 payload = response.json()
@@ -101,6 +116,10 @@ class DeltaClient:
                 code = error.get("code", f"HTTP {response.status_code}") if isinstance(error, dict) else f"HTTP {response.status_code}"
                 context = error.get("context", {}) if isinstance(error, dict) else {}
                 if signed and attempt == 0 and str(code).lower() == "expired_signature":
+                    continue
+                if safe_read and attempt + 1 < attempts and response.status_code in {429, 500, 502, 503, 504}:
+                    self._reset_session()
+                    time.sleep(0.25 * (attempt + 1))
                     continue
                 raise DeltaAPIError(f"Delta request failed: {code}", context=context if isinstance(context, dict) else {})
             return payload
