@@ -763,8 +763,7 @@ class TradeController:
     def _monitor_trade(self, client: DeltaClient, trade: ManagedStraddle) -> None:
         settlement_times = [client.product_settlement_time(leg.product_id) for leg in trade.legs]
         if settlement_times and datetime.now(IST) >= min(settlement_times):
-            trade.current_ask = None
-            trade.current_pnl = None
+            self._mark_trade_expired(trade)
             return
         rows = self._current_rows(trade.asset, trade.expiry)
         call = next((r for r in rows if r.get("symbol") == trade.call_symbol), None)
@@ -784,6 +783,31 @@ class TradeController:
             self._close_trade(client, trade, "Stop: combined ask reached stop multiple")
         elif combined_ask <= target_level:
             self._close_trade(client, trade, "Take profit: combined ask reached target fraction")
+
+    def _mark_trade_expired(self, trade: ManagedStraddle) -> bool:
+        with self.lock:
+            if trade.status != "OPEN":
+                return False
+            trade.current_ask = None
+            trade.current_pnl = None
+            trade.status = "CLOSED"
+            trade.exit_reason = "Contract expired"
+            if self.config:
+                self.config["setups"] = [
+                    setup for setup in self.config.get("setups", [])
+                    if not (setup.get("asset") == trade.asset
+                            and setup.get("call_symbol") == trade.call_symbol
+                            and setup.get("put_symbol") == trade.put_symbol)
+                ]
+                self.config.get("close_at_by_asset", {}).pop(trade.asset, None)
+                self.config.get("close_reason_by_asset", {}).pop(trade.asset, None)
+            if hasattr(self, "pending_entry_setups"):
+                self.pending_entry_setups = [
+                    setup for setup in self.pending_entry_setups
+                    if setup.get("asset") != trade.asset
+                ]
+        self.log(f"{trade.asset} contract expired; segment trade details cleared")
+        return True
 
     def _close_leg(self, client: DeltaClient, leg: TrackedLeg) -> None:
         remaining = max(0, leg.size - leg.closed_size)
@@ -956,6 +980,12 @@ def render_selected_legs(active_setups: list[dict[str, Any]], quantity: int) -> 
 @st.fragment(run_every="3s")
 def render_running_summary(active_controller: TradeController) -> None:
     live_snapshot = active_controller.snapshot()
+    newly_expired = False
+    for old_trade in live_snapshot["trades"]:
+        if old_trade.status == "OPEN" and contract_has_expired(old_trade):
+            newly_expired = active_controller._mark_trade_expired(old_trade) or newly_expired
+    if newly_expired:
+        st.rerun(scope="app")
     active = live_snapshot["state"] in {"ARMED", "RUNNING", "PAUSED", "CLOSING"}
     if active:
         for setup in live_snapshot.get("setups", []):
@@ -1251,19 +1281,21 @@ if not strategy_is_active and snapshot["trades"]:
     trade_table = []
     for trade in snapshot["trades"]:
         expired = contract_has_expired(trade)
-        pnl = None if expired else trade.current_pnl
+        if expired:
+            continue
         trade_table.append({
             "Segment": trade.asset, "Expiry": trade.expiry, "ATM reference": trade.strike,
             "Call strike": trade.call_strike, "Put strike": trade.put_strike,
             "Call": trade.call_symbol, "Put": trade.put_symbol,
             "Entry credit (fills)": trade.entry_credit,
             "Current buyback (asks)": None if expired else trade.current_ask,
-            "Indicative P/L": pnl,
+            "Indicative P/L": trade.current_pnl,
             "Stop ask": trade.entry_credit * trade.stop_multiple,
             "Target ask": trade.entry_credit * trade.take_profit_fraction,
             "State": trade.status, "Exit reason": trade.exit_reason,
         })
-    st.dataframe(pd.DataFrame(trade_table), hide_index=True, width="stretch")
+    if trade_table:
+        st.dataframe(pd.DataFrame(trade_table), hide_index=True, width="stretch")
 if not strategy_is_active:
   with st.expander("Worker activity"):
     if snapshot["events"]:
