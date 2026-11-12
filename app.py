@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import sys
 import threading
 import time
 import uuid
@@ -48,9 +49,18 @@ class DeltaAPIError(RuntimeError):
 class DeltaClient:
     """Small Delta REST client. API secrets are never included in messages."""
 
-    def __init__(self) -> None:
-        self.api_key = api_credential("DELTA_API_KEY")
-        self.api_secret = api_credential("DELTA_API_SECRET")
+    def __init__(self, api_key: str = "", api_secret: str = "") -> None:
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self._thread_sessions = threading.local()
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._thread_sessions, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update({"User-Agent": f"python-{sys.version_info.major}.{sys.version_info.minor}"})
+            self._thread_sessions.session = session
+        return session
 
     @property
     def configured(self) -> bool:
@@ -62,34 +72,39 @@ class DeltaClient:
         query = urlencode(params, doseq=True)
         path_query = path + (f"?{query}" if query else "")
         body_text = json.dumps(body, separators=(",", ":")) if body is not None else ""
-        headers = {"Accept": "application/json"}
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-        if signed:
-            if not self.configured:
-                raise DeltaAPIError("API credentials are missing from .env or Streamlit secrets")
-            timestamp = str(int(time.time()))
-            message = method.upper() + timestamp + path_query + body_text
-            signature = hmac.new(self.api_secret.encode(), message.encode(), hashlib.sha256).hexdigest()
-            headers.update({"api-key": self.api_key, "timestamp": timestamp, "signature": signature})
-        try:
-            response = requests.request(
-                method.upper(), API_BASE + path_query,
-                data=body_text if body is not None else None,
-                headers=headers, timeout=12,
-            )
-        except requests.RequestException as exc:
-            raise DeltaAPIError("Could not reach Delta Exchange") from exc
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise DeltaAPIError(f"Delta returned HTTP {response.status_code} with an unreadable response") from exc
-        if response.status_code >= 400 or not payload.get("success", False):
-            error = payload.get("error", {})
-            code = error.get("code", f"HTTP {response.status_code}") if isinstance(error, dict) else f"HTTP {response.status_code}"
-            context = error.get("context", {}) if isinstance(error, dict) else {}
-            raise DeltaAPIError(f"Delta request failed: {code}", context=context if isinstance(context, dict) else {})
-        return payload
+        if signed and not self.configured:
+            raise DeltaAPIError("API credentials are missing from .env or Streamlit secrets")
+        attempts = 2 if signed else 1
+        for attempt in range(attempts):
+            headers = {"Accept": "application/json"}
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+            if signed:
+                timestamp = str(int(time.time()))
+                message = method.upper() + timestamp + path_query + body_text
+                signature = hmac.new(self.api_secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+                headers.update({"api-key": self.api_key, "timestamp": timestamp, "signature": signature})
+            try:
+                response = self._session().request(
+                    method.upper(), API_BASE + path_query,
+                    data=body_text if body is not None else None,
+                    headers=headers, timeout=12,
+                )
+            except requests.RequestException as exc:
+                raise DeltaAPIError("Could not reach Delta Exchange") from exc
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise DeltaAPIError(f"Delta returned HTTP {response.status_code} with an unreadable response") from exc
+            if response.status_code >= 400 or not payload.get("success", False):
+                error = payload.get("error", {})
+                code = error.get("code", f"HTTP {response.status_code}") if isinstance(error, dict) else f"HTTP {response.status_code}"
+                context = error.get("context", {}) if isinstance(error, dict) else {}
+                if signed and attempt == 0 and str(code).lower() == "expired_signature":
+                    continue
+                raise DeltaAPIError(f"Delta request failed: {code}", context=context if isinstance(context, dict) else {})
+            return payload
+        raise DeltaAPIError("Delta request failed: expired_signature")
 
     def public_chain(self, asset: str) -> list[dict[str, Any]]:
         payload = self._request("GET", "/v2/tickers", {
@@ -117,9 +132,22 @@ class DeltaClient:
         return self._request("GET", f"/v2/orders/{order_id}", signed=True).get("result", {})
 
 
+_DELTA_CLIENT_LOCK = threading.Lock()
+_CACHED_DELTA_CLIENT: DeltaClient | None = None
+_CACHED_DELTA_CREDENTIALS: tuple[str, str] | None = None
+
+
 def get_client() -> DeltaClient:
-    # Keep credentials fresh when the local .env or Streamlit secrets change.
-    return DeltaClient()
+    # Reuse per-thread HTTPS connections; rebuild the client if credentials change.
+    global _CACHED_DELTA_CLIENT, _CACHED_DELTA_CREDENTIALS
+    api_key = api_credential("DELTA_API_KEY")
+    api_secret = api_credential("DELTA_API_SECRET")
+    credentials = (api_key, api_secret)
+    with _DELTA_CLIENT_LOCK:
+        if _CACHED_DELTA_CLIENT is None or credentials != _CACHED_DELTA_CREDENTIALS:
+            _CACHED_DELTA_CLIENT = DeltaClient(api_key, api_secret)
+            _CACHED_DELTA_CREDENTIALS = credentials
+        return _CACHED_DELTA_CLIENT
 
 
 @dataclass
