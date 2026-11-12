@@ -251,8 +251,9 @@ def fetch_chain(asset: str) -> list[dict[str, Any]]:
 
 
 def cached_ask_pnl(trade: ManagedStraddle) -> float | None:
-    chains, _, updated_at = get_market_data_poller().snapshot()
-    if not updated_at or (datetime.now(IST) - updated_at).total_seconds() > 15:
+    chains, errors, updated_at = get_market_data_poller().snapshot()
+    if (trade.asset in errors or not updated_at
+            or (datetime.now(IST) - updated_at).total_seconds() > 15):
         return None
     rows = chains.get(trade.asset, [])
     call = next((row for row in rows if row.get("symbol") == trade.call_symbol), None)
@@ -263,7 +264,12 @@ def cached_ask_pnl(trade: ManagedStraddle) -> float | None:
     put_ask = as_float((put.get("quotes") or {}).get("best_ask"))
     if call_ask is None or put_ask is None:
         return None
-    return trade.entry_credit - call_ask - put_ask
+    call_leg = next((leg for leg in trade.legs if leg.symbol == trade.call_symbol), None)
+    put_leg = next((leg for leg in trade.legs if leg.symbol == trade.put_symbol), None)
+    if not call_leg or not put_leg:
+        return None
+    return ((call_leg.average_fill - call_ask) * call_leg.size
+            + (put_leg.average_fill - put_ask) * put_leg.size)
 
 
 def parse_expiry(symbol: str) -> date | None:
@@ -792,7 +798,13 @@ class TradeController:
             raise DeltaAPIError("Ask quote unavailable; keeping position open and retrying")
         combined_ask = call_ask + put_ask
         trade.current_ask = combined_ask
-        trade.current_pnl = trade.entry_credit - combined_ask
+        call_leg = next((leg for leg in trade.legs if leg.symbol == trade.call_symbol), None)
+        put_leg = next((leg for leg in trade.legs if leg.symbol == trade.put_symbol), None)
+        trade.current_pnl = (
+            (call_leg.average_fill - call_ask) * call_leg.size
+            + (put_leg.average_fill - put_ask) * put_leg.size
+            if call_leg and put_leg else trade.entry_credit - combined_ask
+        )
         stop_level = trade.entry_credit * trade.stop_multiple
         target_level = trade.entry_credit * trade.take_profit_fraction
         if combined_ask >= stop_level:
@@ -1014,9 +1026,9 @@ def render_running_summary(active_controller: TradeController) -> None:
             st.markdown(f"**{asset}**")
             metric_cols = st.columns(4)
             expired = bool(trade and contract_has_expired(trade))
-            live_pnl = trade.current_pnl if trade is not None else None
-            if trade is not None and live_pnl is None and not expired:
-                live_pnl = cached_ask_pnl(trade)
+            live_pnl = cached_ask_pnl(trade) if trade is not None and not expired else None
+            if trade is not None and live_pnl is None:
+                live_pnl = trade.current_pnl
             values = ("—", "—", "—", "—") if trade is None else (
                 f"{trade.entry_credit:,.2f}",
                 f"{trade.entry_credit * trade.take_profit_fraction:,.2f}",
