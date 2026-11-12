@@ -950,7 +950,7 @@ def render_running_summary(active_controller: TradeController) -> None:
 
 
 @st.fragment(run_every="15s")
-def render_api_connection_status(status_slot: Any) -> None:
+def render_api_connection_status(status_slot: Any, worker_status_slot: Any) -> None:
     outbound_ips = get_public_outbound_ips()
     try:
         connected, connection_message, delta_seen_ip = check_api_connection()
@@ -978,6 +978,12 @@ def render_api_connection_status(status_slot: Any) -> None:
             if "IP restriction" in connection_message:
                 st.caption("If Delta currently sees an IPv6 address above, add that exact IPv6 address to the API key allowlist. You can allowlist both address families.")
         st.caption("API credentials are loaded from local .env or Streamlit secrets.")
+    with worker_status_slot:
+        st.success("VPS: Running")
+        if connected:
+            st.success("Delta: Connected")
+        else:
+            st.error("Delta: Disconnected")
 
 
 with st.sidebar:
@@ -991,13 +997,9 @@ with st.sidebar:
     st.header("API connection")
     connection_status_slot = st.container()
     st.header("Background worker")
-    if snapshot["state"] in {"ARMED", "RUNNING", "PAUSED", "CLOSING"}:
-        st.success("Running")
-    else:
-        st.info(snapshot["state"])
-    st.caption("Worker runs while this Streamlit server process stays running.")
+    worker_status_slot = st.container()
 
-render_api_connection_status(connection_status_slot)
+render_api_connection_status(connection_status_slot, worker_status_slot)
 connected = bool(st.session_state.get("delta_api_connected", False))
 
 if not segments:
