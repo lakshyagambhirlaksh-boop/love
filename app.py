@@ -53,6 +53,8 @@ class DeltaClient:
         self.api_key = api_key
         self.api_secret = api_secret
         self._thread_sessions = threading.local()
+        self._settlement_times: dict[int, datetime] = {}
+        self._settlement_lock = threading.Lock()
 
     def _session(self) -> requests.Session:
         session = getattr(self._thread_sessions, "session", None)
@@ -135,6 +137,19 @@ class DeltaClient:
     def connection_check(self) -> None:
         self._request("GET", "/v2/orders", {"state": "open"}, signed=True)
 
+    def product_settlement_time(self, product_id: int) -> datetime:
+        with self._settlement_lock:
+            cached = self._settlement_times.get(product_id)
+        if cached is not None:
+            return cached
+        payload = self._request("GET", f"/v2/products/{int(product_id)}")
+        value = (payload.get("result") or {}).get("settlement_time")
+        if not value:
+            raise DeltaAPIError(f"Settlement time unavailable for product {product_id}")
+        settled_at = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(IST)
+        with self._settlement_lock:
+            return self._settlement_times.setdefault(product_id, settled_at)
+
     def open_positions(self, product_ids: list[int]) -> list[dict[str, Any]]:
         if not product_ids:
             return []
@@ -167,6 +182,17 @@ def get_client() -> DeltaClient:
             _CACHED_DELTA_CLIENT = DeltaClient(api_key, api_secret)
             _CACHED_DELTA_CREDENTIALS = credentials
         return _CACHED_DELTA_CLIENT
+
+
+def contract_has_expired(trade: ManagedStraddle) -> bool:
+    try:
+        client = get_client()
+        settlement_times = [client.product_settlement_time(leg.product_id) for leg in trade.legs]
+        return bool(settlement_times and datetime.now(IST) >= min(settlement_times))
+    except Exception:
+        # Keep the display usable during a temporary public API outage; the
+        # worker will retry settlement-time lookup on its next monitoring pass.
+        return False
 
 
 @dataclass
@@ -735,6 +761,11 @@ class TradeController:
             self.log(f"Opened {setup['asset']} call {setup['call_strike']} / put {setup['put_strike']}; entry credit {trade.entry_credit:.6g}")
 
     def _monitor_trade(self, client: DeltaClient, trade: ManagedStraddle) -> None:
+        settlement_times = [client.product_settlement_time(leg.product_id) for leg in trade.legs]
+        if settlement_times and datetime.now(IST) >= min(settlement_times):
+            trade.current_ask = None
+            trade.current_pnl = None
+            return
         rows = self._current_rows(trade.asset, trade.expiry)
         call = next((r for r in rows if r.get("symbol") == trade.call_symbol), None)
         put = next((r for r in rows if r.get("symbol") == trade.put_symbol), None)
@@ -936,11 +967,12 @@ def render_running_summary(active_controller: TradeController) -> None:
             trade = matching_trades[-1] if matching_trades else None
             st.markdown(f"**{asset}**")
             metric_cols = st.columns(4)
+            expired = bool(trade and contract_has_expired(trade))
             values = ("—", "—", "—", "—") if trade is None else (
                 f"{trade.entry_credit:,.2f}",
                 f"{trade.entry_credit * trade.take_profit_fraction:,.2f}",
                 f"{trade.entry_credit * trade.stop_multiple:,.2f}",
-                f"{trade.current_pnl:,.2f}" if trade.current_pnl is not None else "—",
+                f"{trade.current_pnl:,.2f}" if not expired and trade.current_pnl is not None else "—",
             )
             for col, label, value in zip(metric_cols, ("Total entry price", "Target", "SL", "P & L running"), values):
                 col.metric(label, value)
@@ -1218,13 +1250,14 @@ render_running_summary(controller)
 if not strategy_is_active and snapshot["trades"]:
     trade_table = []
     for trade in snapshot["trades"]:
-        pnl = trade.current_pnl
+        expired = contract_has_expired(trade)
+        pnl = None if expired else trade.current_pnl
         trade_table.append({
             "Segment": trade.asset, "Expiry": trade.expiry, "ATM reference": trade.strike,
             "Call strike": trade.call_strike, "Put strike": trade.put_strike,
             "Call": trade.call_symbol, "Put": trade.put_symbol,
             "Entry credit (fills)": trade.entry_credit,
-            "Current buyback (asks)": trade.current_ask,
+            "Current buyback (asks)": None if expired else trade.current_ask,
             "Indicative P/L": pnl,
             "Stop ask": trade.entry_credit * trade.stop_multiple,
             "Target ask": trade.entry_credit * trade.take_profit_fraction,
