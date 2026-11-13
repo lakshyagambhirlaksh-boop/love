@@ -1061,6 +1061,18 @@ def render_running_summary(active_controller: TradeController) -> None:
         st.rerun(scope="app")
     active = live_snapshot["state"] in {"ARMED", "RUNNING", "PAUSED", "CLOSING"}
     if active:
+        st.markdown(
+            """<style>
+            div[class*="st-key-running_trade_metrics_"] [data-testid="stMetricValue"] {
+                font-size: 1rem !important;
+                white-space: nowrap;
+            }
+            div[class*="st-key-running_trade_metrics_"] [data-testid="stMetricLabel"] {
+                font-size: 0.72rem !important;
+            }
+            </style>""",
+            unsafe_allow_html=True,
+        )
         for setup in live_snapshot.get("setups", []):
             asset = setup["asset"]
             matching_trades = [
@@ -1069,7 +1081,6 @@ def render_running_summary(active_controller: TradeController) -> None:
             ]
             trade = matching_trades[-1] if matching_trades else None
             st.markdown(f"**{asset}**")
-            metric_cols = st.columns(5)
             expired = bool(trade and contract_has_expired(trade))
             ask_prices = cached_ask_prices(trade) if trade is not None and not expired else None
             live_pnl = ask_pnl(trade, *ask_prices) if trade is not None and ask_prices else None
@@ -1083,15 +1094,17 @@ def render_running_summary(active_controller: TradeController) -> None:
                 f"{running_price:,.2f}" if not expired and running_price is not None else "—",
                 f"{live_pnl:,.2f}" if not expired and live_pnl is not None else "—",
             )
-            for col, label, value in zip(
-                metric_cols,
-                ("Total entry price", "Target", "SL", "Total running price", "P & L running"),
-                values,
-            ):
-                if label == "Total running price":
-                    col.metric(label, value, help="Current call ask + put ask, per option pair.")
-                else:
-                    col.metric(label, value)
+            with st.container(key=f"running_trade_metrics_{asset}"):
+                metric_cols = st.columns(5)
+                for col, label, value in zip(
+                    metric_cols,
+                    ("Total entry price", "Target", "SL", "Total running price", "P & L running"),
+                    values,
+                ):
+                    if label == "Total running price":
+                        col.metric(label, value, help="Current call ask + put ask, per option pair.")
+                    else:
+                        col.metric(label, value)
     else:
         st.metric("Strategy status", live_snapshot["state"])
         st.caption(live_snapshot["message"])
