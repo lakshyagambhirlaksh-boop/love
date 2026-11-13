@@ -28,6 +28,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 IST = ZoneInfo("Asia/Kolkata")
 API_BASE = "https://api.india.delta.exchange"
 REFRESH_MS = 3000
+TRADE_MONITOR_INTERVAL_SECONDS = 1.0
 
 
 def api_credential(name: str) -> str:
@@ -754,7 +755,7 @@ class TradeController:
             if all_done:
                 self.log("All strategy trades are closed")
                 return
-            time.sleep(REFRESH_MS / 1000)
+            time.sleep(TRADE_MONITOR_INTERVAL_SECONDS)
 
     def _open_entries(self, client: DeltaClient, config: dict[str, Any]) -> None:
         selected_contracts: list[dict[str, Any]] = []
