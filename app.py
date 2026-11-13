@@ -861,8 +861,16 @@ class TradeController:
         stop_level = trade.entry_credit * trade.stop_multiple
         target_level = trade.entry_credit * trade.take_profit_fraction
         if combined_ask >= stop_level:
+            self.log(
+                f"{trade.asset} STOP-LOSS HIT: combined ask {combined_ask:,.2f} "
+                f">= stop {stop_level:,.2f}; submitting close orders"
+            )
             self._close_trade(client, trade, "Stop: combined ask reached stop multiple")
         elif combined_ask <= target_level:
+            self.log(
+                f"{trade.asset} TAKE-PROFIT HIT: combined ask {combined_ask:,.2f} "
+                f"<= target {target_level:,.2f}; submitting close orders"
+            )
             self._close_trade(client, trade, "Take profit: combined ask reached target fraction")
 
     def _mark_trade_expired(self, trade: ManagedStraddle) -> bool:
@@ -1123,6 +1131,15 @@ def render_running_summary(active_controller: TradeController) -> None:
     else:
         st.metric("Strategy status", live_snapshot["state"])
         st.caption(live_snapshot["message"])
+    exit_events = [
+        event for event in live_snapshot["events"]
+        if "TAKE-PROFIT HIT" in event or "STOP-LOSS HIT" in event
+        or ("Closed " in event and ("Take profit:" in event or "Stop:" in event))
+    ]
+    if exit_events:
+        st.markdown("**Target / stop activity**")
+        for event in exit_events[:6]:
+            st.info(event)
 
 
 @st.fragment(run_every="15s")
