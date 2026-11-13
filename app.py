@@ -994,7 +994,12 @@ if getattr(controller, "_dashboard_schema_version", 0) < 2:
     controller._dashboard_schema_version = 2
 snapshot = controller.snapshot()
 strategy_active = snapshot["state"] in {"ARMED", "RUNNING", "PAUSED", "CLOSING"}
-active_setup_assets = {setup["asset"] for setup in snapshot.get("setups", [])}
+# Retain configured assets only while a run is active. After it closes, the
+# sidebar selection alone must determine which segments can enter the next run.
+active_setup_assets = (
+    {setup["asset"] for setup in snapshot.get("setups", [])}
+    if strategy_active else set()
+)
 
 st.title("Delta Options Dashboard")
 st.caption("Live BTC and XAUT option data · controlled live trading · quotes update in the background")
