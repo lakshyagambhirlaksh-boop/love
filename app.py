@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).with_name(".env"))
 IST = ZoneInfo("Asia/Kolkata")
 API_BASE = "https://api.india.delta.exchange"
-REFRESH_MS = 3000
+REFRESH_MS = 1000
 TRADE_MONITOR_INTERVAL_SECONDS = 1.0
 
 
@@ -200,6 +200,19 @@ def repair_stale_delta_clients() -> int:
             # dashboard must still render even if a worker cannot be migrated.
             continue
     return repaired
+
+
+def refresh_legacy_workers_faster() -> None:
+    """Update the interval global read by worker threads surviving hot reload."""
+    for thread_id, frame in sys._current_frames().items():
+        if frame.f_code.co_name != "_run":
+            continue
+        owner = frame.f_locals.get("self")
+        if owner is None or owner.__class__.__name__ not in {"TradeController", "MarketDataPoller"}:
+            continue
+        worker = getattr(owner, "worker", None)
+        if worker is not None and worker.ident == thread_id:
+            frame.f_globals["REFRESH_MS"] = 1000
 
 
 _DELTA_CLIENT_LOCK = threading.Lock()
@@ -969,6 +982,7 @@ def quote_value(row: dict[str, Any] | None, side: str) -> float | None:
 
 st.set_page_config(page_title="Delta Options Live Dashboard", page_icon="Δ", layout="wide")
 repair_stale_delta_clients()
+refresh_legacy_workers_faster()
 client = get_client()
 controller = get_controller()
 if getattr(controller, "_dashboard_schema_version", 0) < 2:
