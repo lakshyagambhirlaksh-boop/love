@@ -13,6 +13,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as clock_time, timedelta
 from pathlib import Path
+from types import MethodType
 from typing import Any
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
@@ -164,6 +165,40 @@ class DeltaClient:
 
     def get_order(self, order_id: int | str) -> dict[str, Any]:
         return self._request("GET", f"/v2/orders/{order_id}", signed=True).get("result", {})
+
+
+def repair_stale_delta_clients() -> int:
+    """Add settlement lookup to clients retained by workers across hot reloads.
+
+    Streamlit may reload this script while its daemon strategy thread is still
+    alive. That thread can retain a DeltaClient instance created from the
+    previous version of this file, before product_settlement_time existed.
+    Repair those instances in place so the worker keeps monitoring its trades.
+    """
+    repaired = 0
+    for frame in sys._current_frames().values():
+        candidate = frame.f_locals.get("client")
+        if (
+            candidate is None
+            or candidate.__class__.__name__ != "DeltaClient"
+            or callable(getattr(candidate, "product_settlement_time", None))
+            or not callable(getattr(candidate, "_request", None))
+        ):
+            continue
+        try:
+            if not isinstance(getattr(candidate, "_settlement_times", None), dict):
+                candidate._settlement_times = {}
+            if not hasattr(candidate, "_settlement_lock"):
+                candidate._settlement_lock = threading.Lock()
+            candidate.product_settlement_time = MethodType(
+                DeltaClient.product_settlement_time, candidate
+            )
+            repaired += 1
+        except Exception:
+            # Leave an incompatible legacy instance untouched; the active
+            # dashboard must still render even if a worker cannot be migrated.
+            continue
+    return repaired
 
 
 _DELTA_CLIENT_LOCK = threading.Lock()
@@ -928,6 +963,7 @@ def quote_value(row: dict[str, Any] | None, side: str) -> float | None:
 
 
 st.set_page_config(page_title="Delta Options Live Dashboard", page_icon="Δ", layout="wide")
+repair_stale_delta_clients()
 client = get_client()
 controller = get_controller()
 if getattr(controller, "_dashboard_schema_version", 0) < 2:
