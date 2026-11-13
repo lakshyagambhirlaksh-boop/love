@@ -1278,11 +1278,18 @@ if setups or current_state in active_close_states:
     close_control_columns = st.columns(max(1, len(close_setups)))
     for close_col, active_setup in zip(close_control_columns, close_setups):
         asset = active_setup["asset"]
-        scheduled_close = active_snapshot.get("close_at_by_asset", {}).get(asset)
+        asset_is_in_active_run = current_state in active_close_states and asset in active_names_now
+        scheduled_close = (
+            active_snapshot.get("close_at_by_asset", {}).get(asset)
+            if asset_is_in_active_run else None
+        )
         default_close_date = scheduled_close.date() if scheduled_close else active_setup.get("close_date", datetime.now(IST).date())
         default_close_time = scheduled_close.time().replace(tzinfo=None) if scheduled_close else active_setup.get("close_time", clock_time(23, 55))
         with close_col.container(border=True):
             st.markdown(f"**{asset}** · scheduled close: {scheduled_close:%d %b %Y, %H:%M} IST" if scheduled_close else f"**{asset}**")
+            if not scheduled_close:
+                next_close = datetime.combine(default_close_date, default_close_time, tzinfo=IST)
+                st.caption(f"Next run close: {next_close:%d %b %Y, %H:%M} IST")
             if asset in pending_names:
                 st.caption(f"{asset} entry is queued; the worker will send its call and put orders.")
             new_close_date = st.date_input(
@@ -1339,7 +1346,10 @@ if setups or current_state in active_close_states:
             elif current_state == "CLOSING":
                 st.caption("Strategy close is in progress")
             elif st.button(f"Save {asset} close time", key=f"save_close_{asset}", use_container_width=True):
-                st.success(f"{asset} close time saved for the next strategy run")
+                st.success(
+                    f"{asset} next-run close saved: "
+                    f"{datetime.combine(new_close_date, new_close_time):%d %b %Y, %H:%M} IST"
+                )
 
 snapshot = controller.snapshot()
 strategy_is_active = snapshot["state"] in {"ARMED", "RUNNING", "PAUSED", "CLOSING"}
